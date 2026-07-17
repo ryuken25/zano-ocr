@@ -249,14 +249,11 @@ async function recognizeZanoGrid(worker: Worker, file: File, onProgress: (p: num
 }
 
 async function recognize(worker: Worker, file: File, mode: Mode, onProgress: (p: number) => void) {
-  const gridWords = await recognizeZanoGrid(worker, file, onProgress);
-  // gridWords is array of 26 (some may be '' for failed cells)
-  const filled = gridWords.filter(Boolean);
-  // Only accept grid result if ALL 26 cells filled.
-  // OLD BUG: >= 23 accepted incomplete → 3 missing words silently dropped
-  if (filled.length === 26) return gridWords.join(' ');
+  // ── STRATEGY: Full-page OCR FIRST (proven accurate), cell-by-cell as FALLBACK ──
+  // The old approach (grid first) produced garbage like "lalli wully sollouwcth"
+  // because hardcoded cell coordinates don't match all screenshot variants.
 
-  // If grid got most words (≥20), try full-page OCR to fill gaps
+  // Phase 1: Full-page OCR with preprocessing
   await worker.setParameters({
     tessedit_pageseg_mode: '6' as never,
     preserve_interword_spaces: '1',
@@ -265,15 +262,33 @@ async function recognize(worker: Worker, file: File, mode: Mode, onProgress: (p:
 
   const clean = await preprocessImage(file, 'clean');
   const result1 = await worker.recognize(clean);
-  onProgress(85);
-  let combined = `${gridWords.join(' ')}\n${result1.data.text || ''}`;
+  onProgress(40);
+  let combined = result1.data.text || '';
 
   if (mode === 'accurate') {
     const hard = await preprocessImage(file, 'hard');
     const result2 = await worker.recognize(hard);
+    onProgress(70);
     combined += `\n${result2.data.text || ''}`;
   }
 
+  // Check if full-page OCR got us 26 clean words
+  const fullPageWords = extractWords(combined);
+  if (fullPageWords.length >= 26) {
+    onProgress(100);
+    return fullPageWords.slice(0, 26).join(' ');
+  }
+
+  // Phase 2: Cell-by-cell grid as fallback (only if full-page missed words)
+  const gridWords = await recognizeZanoGrid(worker, file, onProgress);
+  const filled = gridWords.filter(Boolean);
+
+  // Merge: prefer full-page words, use grid to fill if full-page was short
+  if (fullPageWords.length < 26 && filled.length > fullPageWords.length) {
+    combined = `${fullPageWords.join(' ')}\n${gridWords.join(' ')}`;
+  }
+
+  onProgress(100);
   return combined;
 }
 
