@@ -2,7 +2,7 @@
   "name": "zano-extract-kenshi",
   "version": "1.0.0",
   "private": true,
-  "description": "Client-side OCR for extracting 23/24-word Zano phrases from screenshots.",
+  "description": "Client-side OCR for extracting 23/24/25/26-word Zano phrases from screenshots.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -10,19 +10,19 @@
   },
   "dependencies": {
     "lucide-react": "latest",
-    "next": "latest",
+    "next": "^14.2.35",
     "react": "latest",
     "react-dom": "latest",
     "tesseract.js": "^6.0.1"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
+    "@types/node": "^26.1.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "autoprefixer": "latest",
     "postcss": "latest",
     "tailwindcss": "^3.4.17",
-    "typescript": "latest"
+    "typescript": "7.0.2"
   },
   "engines": {
     "node": "22.x"

@@ -40,7 +40,26 @@ function formatBytes(bytes: number) {
 const SPECIAL_WORD_FIXES: Record<string, string> = {
   governmen: 'government',
   goverment: 'government',
+  // Zano / common OCR misreads
+  tangal: 'tangle',
+  tangel: 'tangle',
+  tangl: 'tangle',
+  tahgle: 'tangle',
+  angal: 'tangle',
+  tange: 'tangle',
 };
+
+/** Strip leading number prefix from a cell token BEFORE normalization.
+ *  OCR often reads "1.tangle", "1|tangle", "1 tangle", "1)tangle" etc.
+ *  If we normalize first, "1" → "l" and corrupts the word. */
+function stripNumberPrefix(raw: string) {
+  let t = raw.trim();
+  // Match patterns: "1.", "1)", "1|", "1:", "1-", "1 " followed by word
+  // Also handle "1.tangle" (no space) and "1 tangle" (with space)
+  t = t.replace(/^\d{1,2}\s*[.)|:\-]\s*/i, '');
+  t = t.replace(/^\d{1,2}\s+/i, '');
+  return t;
+}
 
 function normalizeToken(token: string) {
   let t = token.toLowerCase().trim();
@@ -57,6 +76,7 @@ function extractWords(text: string) {
   return text
     .replace(/\n/g, ' ')
     .split(/\s+/)
+    .map(stripNumberPrefix) // ← strip "1." "2)" from full-page OCR too
     .map(normalizeToken)
     .filter(Boolean);
 }
@@ -71,7 +91,7 @@ function scoreWindow(words: string[]) {
   return score;
 }
 
-const PHRASE_LENGTHS = [26, 24, 23];
+const PHRASE_LENGTHS = [26, 25, 24, 23];
 
 function extractPhrases(words: string[]) {
   const windows: string[] = [];
@@ -133,7 +153,7 @@ async function preprocessImage(file: File, variant: 'clean' | 'hard' = 'clean') 
   return canvas.toDataURL('image/png');
 }
 
-async function zanoCellImages(file: File) {
+async function zanoCellImages(file: File, y0Offset = 0) {
   const dataUrl = await fileToDataUrl(file);
   const img = await new Promise<HTMLImageElement>((resolve, reject) => {
     const image = new Image();
@@ -143,7 +163,7 @@ async function zanoCellImages(file: File) {
   });
 
   const cols: Array<[number, number]> = [[0.035, 0.325], [0.365, 0.655], [0.695, 0.965]];
-  const y0 = 0.412;
+  const y0 = 0.412 + y0Offset;
   const step = 0.0495;
   const rowH = 0.043;
   const cells: string[] = [];
@@ -181,9 +201,12 @@ async function zanoCellImages(file: File) {
 function cellWord(text: string) {
   let tokens = text
     .split(/\s+/)
+    .map(stripNumberPrefix) // ← strip "1." "2)" etc FIRST, before normalize
     .map(normalizeToken)
     .filter((token) => token && !/^\d+$/.test(token) && token.length <= 18);
 
+  // If OCR read "1.tangle" as single token, stripNumberPrefix + normalize already handled it.
+  // Handle multi-token: "1" "tangle" → stripNumberPrefix("1")="" → filtered out
   if (tokens.length > 1 && tokens[0].length <= 2) tokens = tokens.slice(1);
   if (tokens.length >= 2 && tokens[0].length + tokens[1].length <= 18) return `${tokens[0]}${tokens[1]}`;
   return tokens.sort((a, b) => b.length - a.length)[0] ?? '';
@@ -192,23 +215,52 @@ function cellWord(text: string) {
 async function recognizeZanoGrid(worker: Worker, file: File, onProgress: (p: number) => void) {
   await worker.setParameters({ tessedit_pageseg_mode: '6' as never });
   const cells = await zanoCellImages(file);
-  const words: string[] = [];
+  // Keep ALL 26 positions — empty string for failed cells (don't filter!)
+  const words: string[] = new Array(26).fill('');
+
   for (let i = 0; i < cells.length; i += 1) {
     const result = await worker.recognize(cells[i]);
-    words.push(cellWord(result.data.text || ''));
+    words[i] = cellWord(result.data.text || '');
     onProgress(Math.round(5 + ((i + 1) / cells.length) * 75));
   }
-  return words.filter(Boolean);
+
+  // Retry failed cells with slight y-offset shifts — first 3 cells (row 0) often
+  // fail because the grid y0 doesn't match every screenshot variant.
+  const failed = words.map((w, i) => (w ? -1 : i)).filter((i) => i >= 0);
+  if (failed.length > 0 && failed.length <= 8) {
+    // Try shifting y0 up slightly (first 3 cells = top row most affected)
+    for (const offset of [-0.015, 0.015, -0.03, 0.03]) {
+      const retryCells = await zanoCellImages(file, offset);
+      let stillFailed = 0;
+      for (const i of failed) {
+        if (words[i]) continue;
+        const result = await worker.recognize(retryCells[i]);
+        const w = cellWord(result.data.text || '');
+        if (w) words[i] = w;
+        else stillFailed++;
+      }
+      if (stillFailed === 0) break;
+      failed.length = 0;
+      words.forEach((w, i) => { if (!w) failed.push(i); });
+    }
+  }
+
+  return words; // array of 26, some may be '' (empty) — caller handles
 }
 
 async function recognize(worker: Worker, file: File, mode: Mode, onProgress: (p: number) => void) {
   const gridWords = await recognizeZanoGrid(worker, file, onProgress);
-  if (gridWords.length >= 23) return gridWords.join(' ');
+  // gridWords is array of 26 (some may be '' for failed cells)
+  const filled = gridWords.filter(Boolean);
+  // Only accept grid result if ALL 26 cells filled.
+  // OLD BUG: >= 23 accepted incomplete → 3 missing words silently dropped
+  if (filled.length === 26) return gridWords.join(' ');
 
+  // If grid got most words (≥20), try full-page OCR to fill gaps
   await worker.setParameters({
     tessedit_pageseg_mode: '6' as never,
     preserve_interword_spaces: '1',
-    tessedit_char_whitelist: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \n-_,.;:|[](){}',
+    tessedit_char_whitelist: 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \\n-_,.;:|[](){}',
   });
 
   const clean = await preprocessImage(file, 'clean');
@@ -347,7 +399,7 @@ export default function Home() {
             rawText,
             normalizedWords: words,
             phrases,
-            bestPhrase: phrases[0] ?? (words.length === 23 || words.length === 24 ? words.join(' ') : ''),
+            bestPhrase: phrases[0] ?? ([23, 24, 25, 26].includes(words.length) ? words.join(' ') : ''),
           });
         } catch (err) {
           updateItem(item.id, { status: 'error', error: err instanceof Error ? err.message : String(err), progress: 0 });
@@ -390,7 +442,7 @@ export default function Home() {
               Zano Extract <span className="bg-gradient-to-r from-cyan-300 via-blue-400 to-purple-400 bg-clip-text text-transparent">Kenshi</span>
             </h1>
             <p className="mt-3 max-w-2xl text-base leading-7 text-gray-300">
-              Extract 23/24/26-word Zano recovery phrases from many screenshots at once. Drop images, paste screenshots, or upload a folder; OCR runs locally in your browser.
+              Extract 23/24/25/26-word Zano recovery phrases from many screenshots at once. Drop images, paste screenshots, or upload a folder; OCR runs locally in your browser.
             </p>
           </div>
           <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-4 text-sm text-gray-300 shadow-glow">
@@ -528,7 +580,7 @@ function ResultCard({ item, onCopy }: { item: OcrItem; onCopy: (text: string) =>
               </div>
             </div>
           ) : item.status === 'done' ? (
-            <div className="mt-4 rounded-2xl border border-red-300/20 bg-red-300/10 p-3 text-sm text-red-100">No 23/24-word phrase candidate found. Try Accurate 2-pass or crop the screenshot around the phrase.</div>
+            <div className="mt-4 rounded-2xl border border-red-300/20 bg-red-300/10 p-3 text-sm text-red-100">No 23–26 word phrase candidate found. Try Accurate 2-pass or crop the screenshot around the phrase.</div>
           ) : null}
 
           {item.phrases.length > 1 && (
